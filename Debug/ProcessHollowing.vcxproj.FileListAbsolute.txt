@@ -1,0 +1,2 @@
+C:\Users\atom0\Desktop\ProcessHollowing\Debug\ProcessHollowing.exe
+C:\Users\atom0\Desktop\ProcessHollowing\Debug\ProcessHollowing.pdb
